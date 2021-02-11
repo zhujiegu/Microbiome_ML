@@ -1,0 +1,519 @@
+---
+title: "IgA0 vs HC New"
+author: Zhujie Gu
+output: html_document
+chunk_output_type: console
+editor_options: 
+  chunk_output_type: console
+---
+
+### 5 different preprocessing methods were used on the data ("IgA0 vs HC"). Results of single point analysis (SP), elastic net (EN) and random forest (RF) were compared. Top selected variables from each method were used in the multivariate logistic regression and prediction performance were compared.
+
+```{r setup, include=FALSE}
+source("functions_final.R")
+library(gridExtra)
+library(magrittr)
+library(ggpubr)
+library(limma)
+library(ROCR)
+library(pROC)
+library(plyr)
+library(glmnet)
+library(caret)
+library(ggplot2)
+library(ggcorrplot)
+library(ggpubr)
+library(zCompositions)
+library(randomForest)
+library(parallel)
+library(plotly)
+#library(jmuOutlier)
+# for graphs
+library(Cairo)
+```
+
+# Load data
+```{r, Load raw count and filtering,  include=FALSE, eval=TRUE}
+dat <- readRDS('L6_8000.RDS')
+sample <- readRDS('sample_8000.RDS')
+dat_merge <- readRDS('merged_L6_8000.RDS')
+# dat <- readRDS('L6_8000.RDS')
+# sample <- readRDS('sample.RDS')
+# all.equal(rownames(dat), rownames(dat_HW))
+all.equal(rownames(dat), rownames(sample))
+# all.equal(dat, dat_HW[,1:170])
+rm(dat_merge)
+
+# replace troublesome symbols in colnames (these symbols will mess up in RF)
+colnames(dat) <- gsub(colnames(dat), pattern = "\\[|\\]", replacement = "")
+colnames(dat) <- gsub(colnames(dat), pattern = " ", replacement = "_")
+```
+
+# QC check
+```{r}
+# check if all samples have read counts > 8000
+all(rowSums(dat) > 8000)
+
+# # Filter out bacteria with read counts in less than 10% of samples (0 count in more than 90%)
+# zero_pct <- sapply(dat, function(e) mean(e==0))
+# sum(zero_pct < 0.9)
+# dat <- dat[ ,zero_pct < 0.9]
+```
+
+
+# Define groups (case-control) and subset samples
+```{r, group, include=FALSE, eval=TRUE}
+# Change group here
+
+# CVID vs HC
+# group <- which(sample$pt_category == 1 | sample$pt_category == 4)
+# y <- sample$pt_category[group]
+# y[y==4] <- 0
+
+# IgA0 vs HC
+group <- which(sample$binary.0.1 == '0' | sample$binary.0.1 == 'HC')
+x <- dat[group, ]
+y <- sample$binary.0.1[group]
+y %<>% factor(levels = c("0","HC"), labels = c("Yes","No"))
+
+# Filter out columns with all 0s
+rrm0 <- which(apply(x, 2, sd) == 0)
+if(length(rrm0)!=0) x <- x[,-rrm0]
+```
+
+
+# Zero replacement and transformation
+
+### 1. x_comp: compositional
+### 2. x_clr1: count + 1 -> compositional -> log -> row centering 
+### 3. x_clr0: from R package "compositions"
+### 4. x_czm: czm from R package "zCompositions" -> clr
+### 5. x_gbm: gbm from R package "zCompositions" -> clr
+### 6. x_asinh: asinh on the raw count
+```{r load data, echo=F, message=F, include=FALSE, eval=TRUE}
+# Compositional
+comp <- function(x) {
+  x <- apply(x,1,function(x) (x/sum(x)))
+  return(t(x))
+}
+x_comp <- comp(x)
+
+# clr1
+clr1 <- function(x){
+  x <- x + 1
+  x <- comp(x)
+  x <- log(x)
+  x <- x - rowMeans(x)
+  return(x)
+}
+x_clr1 <- clr1(x)
+
+## clr01
+# clr01 <- function(x){
+#   x[x==0] <- 1
+#   x <- comp(x)
+#   x <- log(x)
+#   x <- x - rowMeans(x)
+#   return(x)
+# }
+# x_clr01 <- clr01(x)
+
+# clr0
+clr0 <- function(x){
+  nr <- dim(x)[1]
+  nc <- dim(x)[2]
+  x <- compositions::clr(x)
+  return(x[1:nr,1:nc])
+}
+x_clr0 <- clr0(x)
+
+
+# czm
+x_czm <- cmultRepl(x, label = 0,method = "CZM", output = c("prop","p-counts"),
+delta = 0.65, threshold = 0.5, correct = TRUE, t = NULL, s = NULL,suppress.print = FALSE)
+#apply(x_czm,1,sum)
+x_czm <- log(x_czm)
+x_czm <- (x_czm - rowMeans(x_czm))
+x_czm %<>% as.matrix()
+
+# GBM can not handle columns with only 1 non-zero read, so filtered out 42 columns first
+nr_non_zero <- apply(x, 2, function(e) length(e[e!=0]))
+rrm <- which(nr_non_zero==1)
+x_gbm_temp <- x[,-rrm]
+x_gbm <- cmultRepl(x_gbm_temp, method = "GBM")
+#apply(x_gbm,1,sum)
+x_gbm <- log(x_gbm)
+x_gbm <- x_gbm - rowMeans(x_gbm)
+x_gbm %<>% as.matrix()
+
+# asinh
+x_asinh <- asinh(x) %>% as.matrix()
+# aa <- seq(0,1,by=0.001)
+# bb <- asinh(aa)
+# plot(aa,bb)
+
+# x_list
+x_list <- list(comp = x_comp, clr1 = x_clr1, clr0 = x_clr0, czm = x_czm, gbm = x_gbm, asinh = x_asinh)
+
+
+# CLR
+# dat_clr <- scale(t(dat_log), scale = F) %>% t %>% data.frame
+```
+
+
+## Covariate: age
+```{r, Covariates, echo=F, eval=FALSE, include=FALSE}
+# Covariates
+Covar <- sample$Age_cont %>% as.matrix()
+colnames(Covar) <- c('Age')
+cov <- Covar[group, ,drop = F]
+colnames(cov) <- "Age"
+rm(Covar)
+```
+
+
+# Correlation
+```{r, echo=FALSE, fig.width=12, fig.height=7}
+p_cor <-list()
+for(i in 1:length(x_list)){
+  # print(paste("Correlation of", names(x_list)[i], "data"))
+  p_cor[[i]] <- myHeatmap(data = x_list[[i]], name = names(x_list)[i])
+}
+# heathap of count data
+p_count <- myHeatmap(data = x, name = "Count")
+
+cairo_ps(file = "Fig3ab", width = 12, height =7, onefile = FALSE, fallback_resolution = 600)
+grid.arrange(arrangeGrob(p_count, bottom = text_grob("(a) count", size=20)), 
+             arrangeGrob(p_cor[[1]], bottom = text_grob("(b) comp", size=20)), 
+             nrow = 1, ncol = 2)
+dev.off()
+
+cairo_ps(file = "Fig4", width = 12, height =8, onefile = FALSE, fallback_resolution = 600)
+grid.arrange(arrangeGrob(p_cor[[1]], bottom = text_grob("(a) comp", size=15)), 
+             arrangeGrob(p_cor[[3]], bottom = text_grob("(b) CLR0", size=15)), 
+             arrangeGrob(p_cor[[6]], bottom = text_grob("(c) asinh", size=15)),
+             arrangeGrob(p_cor[[2]], bottom = text_grob("(d) CLR1", size=15)), 
+             arrangeGrob(p_cor[[4]], bottom = text_grob("(e) czm", size=15)),  
+             arrangeGrob(p_cor[[5]], bottom = text_grob("(f) gbm", size=15)), 
+             nrow = 2, ncol = 3)
+dev.off()
+```
+
+# Subcompositional correlation
+```{r correlation, echo=FALSE, fig.width=16, fig.height=6}
+# L2_raw <- read.table("roos_oral_table-dada2-L2.tsv")
+# L2_count <- L2_raw[,-1] %>% t
+# colnames(L2_count) <- L2_raw$V1
+# L2_comp <- comp(L2_count)
+
+# most abundent 5
+top_ab5 <- (apply(x,2,sum) %>% sort(decreasing = T))[1:5]
+
+x_ab5 <- x %>% dplyr::select(names(top_ab5))
+x_comp_ab5 <- comp(x_ab5)
+
+p1 <- myHeatmap_sub(data = x[,names(top_ab5)], name = "in count data")
+p2 <- myHeatmap_sub(data = x_comp[,names(top_ab5)], name = "in compositional data")
+p3 <- myHeatmap_sub(data = x_comp_ab5, name = "in subcompositional data")
+grid.arrange(arrangeGrob(p1, bottom = text_grob("(a) Count", size=20)), 
+             arrangeGrob(p2, bottom = text_grob("(b) Compositional", size=20)), 
+             arrangeGrob(p3, bottom = text_grob("(c) Subcompositional", size=20)),
+             ncol=3, nrow=1)
+```
+
+# PCA
+```{r PCA, echo=FALSE, fig.width=10, fig.height=4.5}
+
+pca <- list()
+p_pca <- list()
+for(i in 1:length(x_list)){
+  pca <- myPCA(x_list[[i]],groups = y, name = names(x_list)[i],nPC=3,robust=FALSE)
+  p_pca[[i]] <- pca$P1
+}
+
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+mylegend<-g_legend(p_pca[[1]])
+
+lay <- rbind(c(1,1,2,2,3,3,7),
+             c(4,4,5,5,6,6,7))
+
+cairo_ps(file = "Fig5", width = 12, height =8, onefile = FALSE, fallback_resolution = 600)
+
+grid.arrange(arrangeGrob(p_pca[[1]] + theme(legend.position="none"), bottom = text_grob("(a) comp", size=15)), 
+             arrangeGrob(p_pca[[3]] + theme(legend.position="none"), bottom = text_grob("(b) CLR0", size=15)),              
+             arrangeGrob(p_pca[[6]] + theme(legend.position="none"), bottom = text_grob("(c) asinh", size=15)),              
+             arrangeGrob(p_pca[[2]] + theme(legend.position="none"), bottom = text_grob("(d) CLR1", size=15)), 
+             arrangeGrob(p_pca[[4]] + theme(legend.position="none"), bottom = text_grob("(e) czm", size=15)),  
+             arrangeGrob(p_pca[[5]] + theme(legend.position="none"), bottom = text_grob("(f) gbm", size=15)), 
+            mylegend, layout_matrix = lay)
+dev.off()
+
+##################
+# Interactive plots
+##################
+# pca_it1 <- pca_it3 <- list()
+
+# for(i in 1:length(x_list)){
+#   pca <- myPCA(x_list[[i]],groups = y, name = names(x_list)[i],nPC=3,robust=FALSE)
+#   pca_it1[[i]] <- plotly::ggplotly(pca$P1, legendgroup="1")
+#   pca_it3[[i]] <- plotly::ggplotly(pca$P3, legendgroup="1")
+# }
+# 
+# plotly::subplot(pca_it1[[1]], pca_it3[[1]], nrows=1, titleX = T, titleY = T)
+# plotly::subplot(pca_it1[[2]], pca_it3[[2]], nrows=1, titleX = T, titleY = T)
+# plotly::subplot(pca_it1[[3]], pca_it3[[3]], nrows=1, titleX = T, titleY = T)
+# plotly::subplot(pca_it1[[4]], pca_it3[[4]], nrows=1, titleX = T, titleY = T)
+# plotly::subplot(pca_it1[[5]], pca_it3[[5]], nrows=1, titleX = T, titleY = T)
+# plotly::subplot(pca_it1[[6]], pca_it3[[6]], nrows=1, titleX = T, titleY = T)       
+
+
+```
+
+# Percentage of zeros and abundance
+```{r, echo=FALSE, include=FALSE, fig.width=12, fig.height=5}
+z_count <- function(x){
+  return(mean(x==0))
+}
+
+# abundance
+abd <- function(x){
+  return(median(x[x!=0]))
+}
+
+zero_pct <- sapply(data.frame(x_comp), z_count) %>% sort(decreasing = T)
+abd_m <- sapply(data.frame(x_comp), abd) %>% sort(decreasing = T)
+
+zero_pct <- data.frame(name=names(zero_pct), zero_pct=zero_pct, abd = abd_m[names(zero_pct)])
+
+# Percentage of taxon with more than 75% of 0
+mean(zero_pct$zero_pct > 0.75)
+thr <- sum(zero_pct$zero_pct > 0.75)
+
+zero_pct$name <- factor(zero_pct$name, levels = zero_pct$name)
+
+cairo_ps(file = "Fig3c", width = 10, height =5, onefile = FALSE, fallback_resolution = 600)
+ggplot(zero_pct, aes(x=1:139, y=zero_pct)) + 
+  geom_bar(aes(y=zero_pct), stat="identity", alpha = .3) +
+  scale_y_continuous(labels = scales::percent)+
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 15),
+        axis.title = element_text(size = 15)) +
+  xlab("Taxa") +
+  ylab("Zero percentage")+
+  geom_vline(xintercept = thr, linetype="dotted", 
+                color = "red", size=1.5) 
+dev.off()
+
+write.table(zero_pct,file = "zero_pct_abd.csv")
+
+zero_pct %>% filter(grepl("Lact", name))
+
+```
+
+
+# Data split into training (70%) and test (30%)
+```{r}
+set.seed(202101)
+trainIndex <- createDataPartition(y, p=0.7, list = F, times = 1)
+
+x_list_train <- lapply(x_list, function(e) e[trainIndex, ])
+x_list_test <- lapply(x_list, function(e) e[-trainIndex, ])
+cov_train <- cov[trainIndex, ]
+cov_test <- cov[-trainIndex, ]
+y_train <- y[trainIndex]
+y_test <- y[-trainIndex]
+
+# Create 100 Repetition index within the training data
+RepIndex <- createDataPartition(y_train, p=2/3, list = T, times = 100)
+```
+
+
+# SP
+```{r}
+# function to get p_values for one repetition. covariates and outcome added to the data
+sp_train <- function(train_dat, repIndex){
+  rep_dat <- cbind(train_dat[repIndex, ], age = cov_train[repIndex], y = y_train[repIndex])
+  sp(rep_dat, firth = F) 
+}
+
+# parallel computing to get frequency
+sp_get_frq <- function(dat, Nr_core = 4){
+  p_list <- mclapply(RepIndex, mc.cores = Nr_core, function(e) sp_train(dat, e))
+  p_matrix <- do.call(rbind, p_list)
+  frq <- colMeans(p_matrix < 0.05) %>% sort(decreasing = T)
+  return(frq)
+}
+
+# Frequency of being significant
+frq_sp <- lapply(x_list_train, sp_get_frq)
+lapply(frq_sp, head)
+# Rank, same frequency get same rank
+rk_sp <- lapply(frq_sp, function(e) -e %>% rank(ties.method = "min"))
+```
+
+
+# EN
+```{r}
+# function to get p_values for one repetition. covariates and outcome added to the data
+en_train <- function(train_dat, repIndex){
+  rep_dat <- cbind(train_dat[repIndex, ], age = cov_train[repIndex], y = y_train[repIndex])
+  en(rep_dat) 
+}
+
+# parallel computing to get frequency
+# rank1 ranks the frequency of coefficient being non-zero; 
+# rank2 averages the rank of effect size in each iteration
+en_get_rank <- function(dat, Nr_core = 4, rank_method = "rank2"){
+  coef_list <- mclapply(RepIndex, mc.cores = Nr_core, function(e) en_train(dat, e))
+  coef_matrix <- do.call(rbind, coef_list)
+  if(rank_method=='rank1'){
+    frq <- colMeans(coef_matrix !=0) %>% sort(decreasing = T)
+    rk <- -frq %>% rank(ties.method = "min")
+  }
+  if(rank_method=='rank2'){
+    coef_matrix <- abs(coef_matrix) # absolute value of coefficients
+    rk_matrix <- apply(-coef_matrix, 1, function(e) rank(e, ties.method = "min"))
+    rk <- rowMeans(rk_matrix) %>% sort
+  }
+  return(rk)
+}
+
+rk_en <- lapply(x_list_train, en_get_rank)
+lapply(rk_en, head)
+```
+
+
+# RF
+```{r}
+# function to get Gini Index for one repetition. covariates and outcome added to the data
+rf_train <- function(train_dat, repIndex){
+  rep_dat <- cbind(train_dat[repIndex, ], age = cov_train[repIndex], y = y_train[repIndex])
+  rf(rep_dat) 
+}
+
+# parallel computing to get ranks
+rf_get_rank <- function(dat, Nr_core = 4){
+  rank_list <- mclapply(RepIndex, mc.cores = Nr_core, function(e) rf_train(dat, e))
+  rank_matrix <- do.call(rbind, rank_list)
+  rank_avg <- colMeans(rank_matrix) %>% sort
+  return(rank_avg)
+}
+
+# Average ranking
+rk_rf <- lapply(x_list_train, rf_get_rank)
+rk_rf <- lapply(rk_rf, function(e) e[names(e)!="age"])
+lapply(rk_rf, head)
+```
+
+
+# Overall ranking
+```{r}
+get_final_rank <- function(rksp,rken,rkrf){
+  mtrx <- rbind(sp = rksp, en = rken[names(rksp)], rf = rkrf[names(rksp)])
+  avg_rk <- colMeans(mtrx)
+  mtrx <- rbind(mtrx, avg_rk)[,order(avg_rk)]
+  return(mtrx)
+}
+
+rank_matrix <- lapply(1:6, function(e) get_final_rank(rk_sp[[e]],rk_en[[e]],rk_rf[[e]]))
+names(rank_matrix) <- names(rk_sp)
+top_final <- lapply(rank_matrix, function(e) t(e) %>% head)
+names(top_final) <- names(rk_sp)
+top_final
+capture.output(top_final, file = "MB_top.txt")
+
+# average across method
+names <- rownames(top_final$comp)
+avg_rklist <- lapply(top_final, function(e) e[,4][names])
+css_rk <- do.call(cbind, avg_rklist)
+css_rk <- cbind(css_rk, final_rk = rowMeans(css_rk))
+css_rk <- css_rk[order(css_rk[,'final_rk']),]
+css_rk %>% head
+
+write.table(css_rk, 'final_rk.txt')
+
+save(frq_sp,frq_en,rk_sp,rk_en,rk_rf, file='rk_result.RData')
+```
+
+
+# Consensus model
+```{r}
+top_names <- lapply(top_final, function(e) rownames(e)[1:5])
+
+x_list_test_top <- lapply(1:6, function(e) data.frame(cbind(scale(x_list_test[[e]][, top_names[[e]]]), age=as.vector(scale(cov_test)), y=y_test)))
+names(x_list_test_top) <- names(x_list_test)
+
+# multiple logistic model summary
+fit_list <- lapply(x_list_test_top, function(e) glm(formula = factor(y)~., data = e, family = 'binomial'))
+fit_list_summary <- lapply(fit_list, summary)
+capture.output(fit_list_summary, file = "consensus_sum.txt")
+
+# AUC only age
+fit_age <- glm(formula = factor(y)~age, data = x_list_test_top$comp, family = 'binomial')
+prob_age =predict(fit_age,type=c("response"))
+roc(fit_age$y ~ prob_age)
+
+# AUC plots
+auc_plot_test <- function(fit_obj){
+  prob=predict(fit_obj,type=c("response"))
+  g <- roc(fit_obj$y ~ prob)
+  ggroc(g, alpha = 1, legacy.axes = TRUE) + xlab("FPR") + ylab("TPR") +
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="darkgrey", linetype="dashed") +
+    theme(legend.position = "none") + 
+    geom_text(x=0.7, y=0.3, size = 6, label=paste("AUC =", round(g$auc, digit = 3)))
+}
+
+p <- lapply(fit_list, auc_plot_test)
+grid.arrange(arrangeGrob(p[[1]], bottom = text_grob("(a) Compositional", size=15)), 
+             arrangeGrob(p[[2]], bottom = text_grob("(b) CLR1", size=15)), 
+             arrangeGrob(p[[3]], bottom = text_grob("(c) CLR0", size=15)), 
+             arrangeGrob(p[[4]], bottom = text_grob("(d) czm", size=15)), 
+             arrangeGrob(p[[5]], bottom = text_grob("(e) gbm", size=15)), 
+             arrangeGrob(p[[6]], bottom = text_grob("(f) asinh", size=15)), 
+             nrow = 2, ncol = 3)
+```
+
+# Consensus model with "Lactobacillales" "Prevotella_all"  "Alloprevotella" 
+```{r}
+final_nm <- rownames(css_rk)[1:3]
+
+x_list_final_top <- lapply(1:6, function(e) data.frame(cbind(scale(x_list[[e]][, final_nm]), age=as.vector(scale(cov)), y=y)))
+names(x_list_final_top) <- names(x_list)
+
+
+# multiple logistic on whole dataset
+fit_list <- lapply(x_list_final_top, function(e) glm(formula = factor(y)~., data = e, family = 'binomial'))
+fit_list_summary <- lapply(fit_list, summary)
+
+capture.output(fit_list_summary, file = "temp.txt")
+
+
+# univariate
+
+sp_top3 <- function(dat){
+  eff_pval <- matrix(NA, 3,3)
+  for(i in 1:3){
+  fit <-glm(factor(y, levels = c(1,2), labels = c('yes','no'))~age+dat[,i], data=dat,
+                              family = "binomial")
+  # print(summary(fit)$coef)
+  eff_pval[i,] <- summary(fit)$coef[3,c(1,2,4)] # 3rd row (1.intercept, 2.age, 3.bacteria); 4th column p-value
+  }
+  return(eff_pval)
+}
+
+fit_list <- lapply(x_list_final_top, sp_top3)
+fit_list
+
+
+capture.output(fit_list, file = "temp.txt")
+```
+
+
+```{r}
+lapply(x_list, function(e) cor(e[,c('Prevotella_all','Alloprevotella')])[1,2])
+```
